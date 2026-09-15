@@ -242,6 +242,15 @@ async function getTeamLogos() {
   return teamLogoInflight;
 }
 
+/**
+ * Rewrite an upstream image URL so it goes through our own image proxy.
+ * Returns '' for empty/missing input.
+ */
+function toProxiedImage(url) {
+  if (!url || typeof url !== 'string') return '';
+  return `/api/isports/image?url=${encodeURIComponent(url)}`;
+}
+
 // ============ DATA TRANSFORMERS ============
 //
 // iSportsAPI returns arrays of raw objects. We normalise field names so the
@@ -274,12 +283,12 @@ class DataTransformer {
 
       homeTeamId,
       homeTeamName: m.homeName ?? m.homeTeam?.name ?? '',
-      homeTeamLogo: teamLogos[homeTeamId] ?? '',
+      homeTeamLogo: toProxiedImage(teamLogos[homeTeamId]),
       homeScore: m.homeScore ?? null,
 
       awayTeamId,
       awayTeamName: m.awayName ?? m.awayTeam?.name ?? '',
-      awayTeamLogo: teamLogos[awayTeamId] ?? '',
+      awayTeamLogo: toProxiedImage(teamLogos[awayTeamId]),
       awayScore: m.awayScore ?? null,
 
       status: m.status ?? '',
@@ -294,7 +303,7 @@ class DataTransformer {
       leagueId: String(t.leagueId ?? ''),
       name: t.name ?? '',
       shortName: t.shortName ?? t.name ?? '',
-      logo: t.logo ?? '',
+      logo: toProxiedImage(t.logo),
       foundingDate: t.foundingDate ?? '',
     };
   }
@@ -650,6 +659,75 @@ app.get(
   })
 );
 
+/**
+ * GET /api/isports/image?url=<encoded-image-url>
+ *
+ * Proxies team logo images so the Flutter Web client can display them
+ * without mixed-content or CORS blocks. Only allows known image hosts.
+ */
+app.get(
+  '/api/isports/image',
+  wrap(async (req, res) => {
+    const { url } = req.query;
+    if (!url) {
+      return res.status(400).json({
+        success: false,
+        error: 'url parameter is required',
+      });
+    }
+
+    // Whitelist hosts — never proxy arbitrary URLs (SSRF risk).
+    let target;
+    try {
+      target = new URL(url);
+    } catch {
+      return res.status(400).json({ success: false, error: 'invalid url' });
+    }
+
+    const ALLOWED_HOSTS = new Set([
+      'zq.titan007.com',
+      'www.titan007.com',
+      'titan007.com',
+    ]);
+
+    if (!ALLOWED_HOSTS.has(target.hostname)) {
+      return res.status(400).json({
+        success: false,
+        error: `host not allowed: ${target.hostname}`,
+      });
+    }
+
+    // Fetch the upstream image with a timeout.
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+    try {
+      const upstream = await fetch(target.toString(), {
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+
+      if (!upstream.ok) {
+        return res.status(upstream.status).end();
+      }
+
+      const contentType =
+        upstream.headers.get('content-type') ?? 'image/png';
+
+      // Cache aggressively — team logos don't change.
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Cache-Control', 'public, max-age=604800'); // 7 days
+      res.setHeader('Access-Control-Allow-Origin', '*');
+
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      res.end(buf);
+    } catch (err) {
+      clearTimeout(timeoutId);
+      console.warn(`Image proxy failed for ${url}:`, err.message);
+      return res.status(502).end();
+    }
+  })
+);
+
 // ============ SYSTEM ENDPOINTS ============
 
 app.post('/api/cache/clear', (req, res) => {
@@ -777,6 +855,12 @@ app.get('/', (req, res) => {
         method: 'GET',
         params: ['playerId'],
         example: '/api/isports/player?playerId=999',
+      },
+      {
+        path: '/api/isports/image',
+        method: 'GET',
+        params: ['url'],
+        example: '/api/isports/image?url=http%3A%2F%2Fzq.titan007.com%2F...',
       },
     ],
     systemEndpoints: [
