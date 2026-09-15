@@ -26,16 +26,16 @@ app.use('/api', limiter);
 const CONFIG = {
   isports: {
     baseUrl: 'https://api.isportsapi.com',
-    // Read from env in production. Never commit the real key.
     apiKey: process.env.ISPORTS_API_KEY || 'ycOrrj2NLYdzuOBr',
   },
   cache: {
-    stdTTL: 60, // live data changes fast; 60s is a sane default
+    stdTTL: 60,
     checkperiod: 60,
   },
   leagueLogo: {
-    ttlMs: 6 * 60 * 60 * 1000, // 6 hours
-    concurrency: 10,           // max parallel per-league logo fetches
+    ttlMs: 6 * 60 * 60 * 1000,        // 6 hours for successful lookups
+    emptyTtlMs: 30 * 60 * 1000,       // 30 minutes for empty/failed lookups
+    concurrency: 10,
   },
 };
 
@@ -51,10 +51,6 @@ class ISportsService {
     this.apiKey = CONFIG.isports.apiKey;
   }
 
-  /**
-   * Build a fully-qualified iSportsAPI URL with api_key injected.
-   * All other query params are passed through unchanged.
-   */
   buildUrl(path, params = {}) {
     const url = new URL(this.baseUrl + path);
     url.searchParams.set('api_key', this.apiKey);
@@ -66,9 +62,6 @@ class ISportsService {
     return url.toString();
   }
 
-  /**
-   * Fetch with timeout. Uses global fetch (Node 18+).
-   */
   async fetchWithTimeout(url, timeout = 20000) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeout);
@@ -89,7 +82,6 @@ class ISportsService {
         throw new Error(`Non-JSON response: ${text.slice(0, 200)}`);
       }
 
-      // iSportsAPI envelope: { code, message, data }
       if (json.code !== 0 && json.code !== '0') {
         throw new Error(
           `iSportsAPI error ${json.code}: ${json.message || 'unknown'}`
@@ -133,10 +125,6 @@ class ISportsService {
 
   // ============ TEAMS ============
 
-  /**
-   * Teams for a league. Pass `leagueId` to filter; omit it to fetch ALL
-   * teams (~16 MB payload, 60s timeout).
-   */
   async getTeamsByLeague(leagueId) {
     return this.fetchWithTimeout(
       this.buildUrl('/sport/football/team', { leagueId }),
@@ -210,14 +198,6 @@ class ISportsService {
 const isports = new ISportsService();
 
 // ============ PER-LEAGUE TEAM LOGO CACHE ============
-//
-// We never fetch the 16 MB global team list. Instead we cache team logos
-// per league (a few KB each), keyed by leagueId, with a 6-hour TTL.
-//
-// Two maps:
-//   leagueLogoCache     : leagueId -> { data: { teamId: logo }, expiresAt }
-//   leagueLogoInflight  : leagueId -> Promise  (de-dupe concurrent fetches)
-//
 const leagueLogoCache = new Map();
 const leagueLogoInflight = new Map();
 
@@ -233,15 +213,30 @@ async function getLeagueLogos(leagueId) {
   const p = isports
     .getTeamLogosByLeague(leagueId)
     .then((logos) => {
+      const isEmpty = !logos || Object.keys(logos).length === 0;
+
+      if (isEmpty) {
+        console.warn(
+          `⚠️  League ${leagueId} returned 0 teams — no logos available upstream`
+        );
+      }
+
       leagueLogoCache.set(leagueId, {
         data: logos,
-        expiresAt: Date.now() + CONFIG.leagueLogo.ttlMs,
+        // Cache empty results for less time so we retry sooner.
+        expiresAt:
+          Date.now() +
+          (isEmpty ? CONFIG.leagueLogo.emptyTtlMs : CONFIG.leagueLogo.ttlMs),
       });
       return logos;
     })
     .catch((err) => {
-      // Failures are not cached — the next request will retry.
       console.warn(`League ${leagueId} logo fetch failed:`, err.message);
+      // Cache failures briefly so we don't hammer a broken upstream.
+      leagueLogoCache.set(leagueId, {
+        data: {},
+        expiresAt: Date.now() + CONFIG.leagueLogo.emptyTtlMs,
+      });
       return {};
     })
     .finally(() => {
@@ -252,10 +247,6 @@ async function getLeagueLogos(leagueId) {
   return p;
 }
 
-/**
- * Run promises with a bounded concurrency. Prevents a schedule spanning
- * 100+ leagues from opening 100+ simultaneous sockets to iSportsAPI.
- */
 async function mapWithConcurrency(items, concurrency, fn) {
   const results = new Array(items.length);
   let next = 0;
@@ -276,16 +267,10 @@ async function mapWithConcurrency(items, concurrency, fn) {
   return results;
 }
 
-/**
- * Fetch logos for every league represented in a match list and merge them
- * into a single { teamId: logo } map.
- */
 async function getLogosForMatches(matches) {
   const leagueIds = [
     ...new Set(
-      matches
-        .map((m) => String(m.leagueId ?? ''))
-        .filter(Boolean)
+      matches.map((m) => String(m.leagueId ?? '')).filter(Boolean)
     ),
   ];
 
@@ -302,14 +287,27 @@ async function getLogosForMatches(matches) {
   return merged;
 }
 
-// ============ IMAGE PROXY HELPER ============
+// ============ IMAGE HELPERS ============
+
 /**
- * Rewrite an upstream image URL so it goes through our own image proxy.
- * Returns '' for empty/missing input.
+ * Return a proxied URL for a real logo, or a self-hosted monogram avatar
+ * fallback derived from the team name. Never returns ''.
+ *
+ * @param {string|undefined} url raw logo URL from iSportsAPI
+ * @param {string|undefined} fallbackName team name for the monogram
  */
-function toProxiedImage(url) {
-  if (!url || typeof url !== 'string') return '';
-  return `/api/isports/image?url=${encodeURIComponent(url)}`;
+function toProxiedImage(url, fallbackName) {
+  // Real logo → proxy it through our own server.
+  if (url && typeof url === 'string' && url.length > 0) {
+    return `/api/isports/image?url=${encodeURIComponent(url)}`;
+  }
+
+  // No logo → monogram avatar based on the team name.
+  const name =
+    typeof fallbackName === 'string' && fallbackName.trim().length > 0
+      ? fallbackName.trim()
+      : '?';
+  return `/api/isports/avatar?name=${encodeURIComponent(name)}`;
 }
 
 // ============ DATA TRANSFORMERS ============
@@ -325,13 +323,11 @@ class DataTransformer {
     };
   }
 
-  /**
-   * @param {object} m raw match object from iSportsAPI
-   * @param {Record<string,string>} teamLogos optional { teamId: logo } map
-   */
   static match(m, teamLogos = {}) {
     const homeTeamId = String(m.homeId ?? m.homeTeamId ?? '');
     const awayTeamId = String(m.awayId ?? m.awayTeamId ?? '');
+    const homeTeamName = m.homeName ?? m.homeTeam?.name ?? '';
+    const awayTeamName = m.awayName ?? m.awayTeam?.name ?? '';
 
     return {
       matchId: String(m.matchId ?? ''),
@@ -339,13 +335,13 @@ class DataTransformer {
       leagueName: m.leagueName ?? m.league?.name ?? '',
 
       homeTeamId,
-      homeTeamName: m.homeName ?? m.homeTeam?.name ?? '',
-      homeTeamLogo: toProxiedImage(teamLogos[homeTeamId]),
+      homeTeamName,
+      homeTeamLogo: toProxiedImage(teamLogos[homeTeamId], homeTeamName),
       homeScore: m.homeScore ?? null,
 
       awayTeamId,
-      awayTeamName: m.awayName ?? m.awayTeam?.name ?? '',
-      awayTeamLogo: toProxiedImage(teamLogos[awayTeamId]),
+      awayTeamName,
+      awayTeamLogo: toProxiedImage(teamLogos[awayTeamId], awayTeamName),
       awayScore: m.awayScore ?? null,
 
       status: m.status ?? '',
@@ -360,7 +356,7 @@ class DataTransformer {
       leagueId: String(t.leagueId ?? ''),
       name: t.name ?? '',
       shortName: t.shortName ?? t.name ?? '',
-      logo: toProxiedImage(t.logo),
+      logo: toProxiedImage(t.logo, t.name),
       foundingDate: t.foundingDate ?? '',
     };
   }
@@ -368,10 +364,11 @@ class DataTransformer {
   static standingRow(row, teamInfoById) {
     const teamId = String(row.teamId ?? '');
     const info = teamInfoById[teamId] || {};
+    const teamName = info.name ?? row.name ?? '';
     return {
       teamId,
-      teamName: info.name ?? row.name ?? '',
-      teamLogo: info.logo ?? '',
+      teamName,
+      teamLogo: toProxiedImage(info.logo, teamName),
       position: row.position ?? row.rank ?? null,
       played: row.played ?? row.matches ?? null,
       won: row.won ?? row.win ?? null,
@@ -436,9 +433,6 @@ function cacheGetOrSet(res, key, producer) {
 
 // ============ ROUTES ============
 
-/**
- * GET /api/isports/leagues
- */
 app.get(
   '/api/isports/leagues',
   wrap(async (req, res) => {
@@ -450,10 +444,6 @@ app.get(
   })
 );
 
-/**
- * GET /api/isports/livescores
- * Enriched with per-league team logos (no 16 MB global fetch).
- */
 app.get(
   '/api/isports/livescores',
   wrap(async (req, res) => {
@@ -466,10 +456,6 @@ app.get(
   })
 );
 
-/**
- * GET /api/isports/schedule?date=YYYY-MM-DD
- * Enriched with per-league team logos (no 16 MB global fetch).
- */
 app.get(
   '/api/isports/schedule',
   wrap(async (req, res) => {
@@ -491,9 +477,6 @@ app.get(
   })
 );
 
-/**
- * GET /api/isports/match?matchId=...
- */
 app.get(
   '/api/isports/match',
   wrap(async (req, res) => {
@@ -511,10 +494,6 @@ app.get(
   })
 );
 
-/**
- * GET /api/isports/teams?leagueId=...
- * leagueId is optional; omitting it hits the unfiltered ~16 MB endpoint.
- */
 app.get(
   '/api/isports/teams',
   wrap(async (req, res) => {
@@ -532,9 +511,6 @@ app.get(
   })
 );
 
-/**
- * GET /api/isports/team?teamId=...
- */
 app.get(
   '/api/isports/team',
   wrap(async (req, res) => {
@@ -552,9 +528,6 @@ app.get(
   })
 );
 
-/**
- * GET /api/isports/standings?leagueId=...
- */
 app.get(
   '/api/isports/standings',
   wrap(async (req, res) => {
@@ -569,7 +542,6 @@ app.get(
     await cacheGetOrSet(res, `isports_standings_${leagueId}`, async () => {
       const raw = await isports.getStandings(leagueId);
 
-      // iSportsAPI returns { teamInfos: [...], totalStandings: [...] }
       if (!raw || typeof raw !== 'object') return [];
 
       const teamInfos = Array.isArray(raw.teamInfos) ? raw.teamInfos : [];
@@ -591,9 +563,6 @@ app.get(
   })
 );
 
-/**
- * GET /api/isports/lineups?matchId=...
- */
 app.get(
   '/api/isports/lineups',
   wrap(async (req, res) => {
@@ -627,9 +596,6 @@ app.get(
   })
 );
 
-/**
- * GET /api/isports/events?matchId=...
- */
 app.get(
   '/api/isports/events',
   wrap(async (req, res) => {
@@ -648,9 +614,6 @@ app.get(
   })
 );
 
-/**
- * GET /api/isports/stats?matchId=...
- */
 app.get(
   '/api/isports/stats',
   wrap(async (req, res) => {
@@ -681,9 +644,6 @@ app.get(
   })
 );
 
-/**
- * GET /api/isports/player?playerId=...
- */
 app.get(
   '/api/isports/player',
   wrap(async (req, res) => {
@@ -700,15 +660,53 @@ app.get(
   })
 );
 
+// ============ MONOGRAM AVATAR ============
 /**
- * GET /api/isports/image?url=<encoded-image-url>
+ * GET /api/isports/avatar?name=Deportes%20Santa%20Cruz
  *
- * Proxies team logo images so the Flutter Web client can display them
- * without mixed-content or CORS blocks. Only allows known image hosts.
+ * Returns a small SVG with the first letters of the first two words of the
+ * name, on a color derived deterministically from the name. Used as a
+ * fallback when iSportsAPI has no logo for a team.
  */
+app.get('/api/isports/avatar', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+
+  const rawName = (req.query.name || '?').toString();
+  const name = rawName.trim().slice(0, 60); // cap length
+
+  // Take first character of the first two words, uppercase.
+  const words = name.split(/\s+/).filter(Boolean);
+  const initials =
+    (words[0]?.[0] || '?').toUpperCase() +
+    (words[1]?.[0] || '').toUpperCase();
+
+  // Deterministic hue from the name.
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) {
+    hash = (hash * 31 + name.charCodeAt(i)) | 0;
+  }
+  const hue = Math.abs(hash) % 360;
+  const bg = `hsl(${hue}, 55%, 45%)`;
+
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="10" fill="${bg}"/>
+  <text x="32" y="41" font-family="Arial, Helvetica, sans-serif"
+        font-size="26" font-weight="700" fill="#ffffff"
+        text-anchor="middle">${initials}</text>
+</svg>`;
+
+  res.setHeader('Content-Type', 'image/svg+xml');
+  res.setHeader('Cache-Control', 'public, max-age=604800'); // 7 days
+  res.send(svg);
+});
+
+// ============ IMAGE PROXY ============
 app.get(
   '/api/isports/image',
   wrap(async (req, res) => {
+    // Set CORS early so it's present on every response path.
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
     const { url } = req.query;
     if (!url) {
       return res.status(400).json({
@@ -753,8 +751,7 @@ app.get(
         upstream.headers.get('content-type') ?? 'image/png';
 
       res.setHeader('Content-Type', contentType);
-      res.setHeader('Cache-Control', 'public, max-age=604800'); // 7 days
-      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Cache-Control', 'public, max-age=604800');
 
       const buf = Buffer.from(await upstream.arrayBuffer());
       res.end(buf);
@@ -815,9 +812,9 @@ app.get('/api/health', (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     name: 'iSportsAPI Proxy',
-    version: '1.2.0',
+    version: '1.3.0',
     description:
-      'Express proxy for iSportsAPI with CORS, caching, and per-league logo enrichment',
+      'Express proxy for iSportsAPI with CORS, caching, per-league logo enrichment, and monogram fallback',
     baseUrl: `http://localhost:${PORT}`,
     endpoints: [
       { path: '/api/isports/leagues', method: 'GET', params: [], example: '/api/isports/leagues' },
@@ -832,6 +829,7 @@ app.get('/', (req, res) => {
       { path: '/api/isports/stats', method: 'GET', params: ['matchId'], example: '/api/isports/stats?matchId=12345' },
       { path: '/api/isports/player', method: 'GET', params: ['playerId'], example: '/api/isports/player?playerId=999' },
       { path: '/api/isports/image', method: 'GET', params: ['url'], example: '/api/isports/image?url=http%3A%2F%2Fzq.titan007.com%2F...' },
+      { path: '/api/isports/avatar', method: 'GET', params: ['name'], example: '/api/isports/avatar?name=Deportes%20Santa%20Cruz' },
     ],
     systemEndpoints: [
       { path: '/api/health', method: 'GET', description: 'Health check' },
@@ -853,17 +851,18 @@ app.use((err, req, res, next) => {
 
 // ============ START ============
 app.listen(PORT, () => {
-  console.log(`\n🚀 iSportsAPI Proxy v1.2`);
+  console.log(`\n🚀 iSportsAPI Proxy v1.3`);
   console.log(`📡 http://localhost:${PORT}`);
   console.log(`\n📊 Endpoints:`);
   console.log(`  - Leagues:   /api/isports/leagues`);
-  console.log(`  - Live:      /api/isports/livescores   (per-league logo cache)`);
-  console.log(`  - Schedule:  /api/isports/schedule?date=YYYY-MM-DD  (per-league logo cache)`);
-  console.log(`  - Teams:     /api/isports/teams?leagueId=...  (leagueId optional)`);
+  console.log(`  - Live:      /api/isports/livescores`);
+  console.log(`  - Schedule:  /api/isports/schedule?date=YYYY-MM-DD`);
+  console.log(`  - Teams:     /api/isports/teams?leagueId=...`);
   console.log(`  - Standings: /api/isports/standings?leagueId=...`);
   console.log(`  - Lineups:   /api/isports/lineups?matchId=...`);
   console.log(`  - Events:    /api/isports/events?matchId=...`);
   console.log(`  - Stats:     /api/isports/stats?matchId=...`);
   console.log(`  - Image:     /api/isports/image?url=...`);
+  console.log(`  - Avatar:    /api/isports/avatar?name=...`);
   console.log(`\n📖 Docs: http://localhost:${PORT}/\n`);
 });
