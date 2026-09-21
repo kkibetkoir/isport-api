@@ -328,24 +328,39 @@ class DataTransformer {
     const awayTeamId = String(m.awayId ?? m.awayTeamId ?? '');
     const homeTeamName = m.homeName ?? m.homeTeam?.name ?? '';
     const awayTeamName = m.awayName ?? m.awayTeam?.name ?? '';
-
+  
     return {
       matchId: String(m.matchId ?? ''),
+  
       leagueId: String(m.leagueId ?? ''),
+      leagueType: m.leagueType ?? null,
       leagueName: m.leagueName ?? m.league?.name ?? '',
-
-      homeTeamId,
+      leagueShortName: m.leagueShortName ?? '',
+      leagueColor: m.leagueColor ?? '',
+  
+      matchTime: m.matchTime ?? m.time ?? null,
+      status: m.status ?? '',
+  
+      homeId: homeTeamId,
+      homeName: homeTeamName,
+      homeTeamId,                                   // keep both spellings
       homeTeamName,
       homeTeamLogo: toProxiedImage(teamLogos[homeTeamId], homeTeamName),
       homeScore: m.homeScore ?? null,
-
-      awayTeamId,
+      homeHalfScore: m.homeHalfScore ?? null,
+  
+      awayId: awayTeamId,
+      awayName: awayTeamName,
+      awayTeamId,                                   // keep both spellings
       awayTeamName,
       awayTeamLogo: toProxiedImage(teamLogos[awayTeamId], awayTeamName),
       awayScore: m.awayScore ?? null,
-
-      status: m.status ?? '',
-      matchTime: m.matchTime ?? m.time ?? '',
+      awayHalfScore: m.awayHalfScore ?? null,
+  
+      explain: m.explain ?? '',
+      extraExplain: m.extraExplain ?? null,
+      neutral: m.neutral ?? false,
+  
       kickoff: m.kickoff ?? m.startTime ?? '',
     };
   }
