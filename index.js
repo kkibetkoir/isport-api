@@ -138,11 +138,31 @@ class ISportsService {
     return this.fetchWithTimeout(this.buildUrl('/sport/football/livescores'));
   }
 
-  async getSchedule(date) {
-    return this.fetchWithTimeout(
-      this.buildUrl('/sport/football/schedule', { date })
-    );
-  }
+/**
+ * Schedule endpoint. Per iSportsAPI docs, at least one of
+ * `date`, `leagueId`, or `matchId` is required, and they are
+ * mutually exclusive.
+ *
+ * @param {object} params
+ * @param {string} [params.date]     yyyy-MM-dd (GMT+0)
+ * @param {string} [params.leagueId] league or cup id
+ * @param {string} [params.matchId]  one or more match ids, comma-separated (max 100)
+ * @param {string} [params.season]      only with leagueId
+ * @param {string} [params.subLeagueId] only with leagueId
+ * @param {string} [params.stageId]     only with leagueId
+ */
+async getSchedule({ date, leagueId, matchId, season, subLeagueId, stageId } = {}) {
+  return this.fetchWithTimeout(
+    this.buildUrl('/sport/football/schedule', {
+      date,
+      leagueId,
+      matchId,
+      season,
+      subLeagueId,
+      stageId,
+    })
+  );
+}
 
   async getMatchDetail(matchId) {
     return this.fetchWithTimeout(
@@ -488,23 +508,84 @@ app.get(
 );
 
 /**
- * GET /api/isports/schedule?date=YYYY-MM-DD
- * Fixtures for a date with team logos rewritten.
+ * GET /api/isports/schedule
+ *
+ * Exactly one of these is required:
+ *   ?date=YYYY-MM-DD       — matches on a given day
+ *   ?leagueId=...          — current season for a league
+ *   ?matchId=...           — one or more ids, comma-separated (max 100)
+ *
+ * Optional modifiers (only valid with leagueId):
+ *   ?season=2025-2026
+ *   ?subLeagueId=...
+ *   ?stageId=...
  */
 app.get(
   '/api/isports/schedule',
   wrap(async (req, res) => {
-    const { date } = req.query;
-    if (!date) {
+    const { date, leagueId, matchId, season, subLeagueId, stageId } = req.query;
+
+    // --- Validation: exactly one primary selector ---
+    const selectors = [date, leagueId, matchId].filter(
+      (v) => v !== undefined && v !== null && v !== ''
+    );
+
+    if (selectors.length === 0) {
       return res.status(400).json({
         success: false,
-        error: 'date parameter is required',
+        error: 'At least one of date, leagueId, or matchId is required',
         usage: '/api/isports/schedule?date=2026-09-15',
       });
     }
 
-    await cacheGetOrSet(res, `isports_schedule_${date}`, async () => {
-      const raw = await isports.getSchedule(date);
+    if (selectors.length > 1) {
+      return res.status(400).json({
+        success: false,
+        error:
+          'date, leagueId, and matchId are mutually exclusive — provide only one',
+      });
+    }
+
+    // --- Validation: season/subLeagueId/stageId require leagueId ---
+    if (!leagueId && (season || subLeagueId || stageId)) {
+      return res.status(400).json({
+        success: false,
+        error:
+          'season, subLeagueId, and stageId can only be used with leagueId',
+      });
+    }
+
+    // --- Cache key reflects whichever selector was used ---
+    let cacheKey;
+    if (date) {
+      cacheKey = `isports_schedule_date_${date}`;
+    } else if (leagueId) {
+      cacheKey = `isports_schedule_league_${leagueId}`;
+      if (season) cacheKey += `_s_${season}`;
+      if (subLeagueId) cacheKey += `_sub_${subLeagueId}`;
+      if (stageId) cacheKey += `_stage_${stageId}`;
+    } else {
+      // matchId — normalize by sorting IDs so ?matchId=1,2 and ?matchId=2,1
+      // hit the same cache entry.
+      const normalized = matchId
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .sort()
+        .join(',');
+      cacheKey = `isports_schedule_match_${normalized}`;
+    }
+
+    await cacheGetOrSet(res, cacheKey, async () => {
+      const raw = await isports.getSchedule({
+        date,
+        leagueId,
+        matchId,
+        season,
+        subLeagueId,
+        stageId,
+      });
+
       if (!Array.isArray(raw)) return [];
 
       const teamLogos = await getLogosForMatches(raw);
@@ -848,7 +929,20 @@ app.get('/', (req, res) => {
       { path: '/api/isports/leagues/reload', method: 'POST', example: '/api/isports/leagues/reload' },
       { path: '/api/isports/countries', method: 'GET', example: '/api/isports/countries' },
       { path: '/api/isports/livescores', method: 'GET', example: '/api/isports/livescores' },
-      { path: '/api/isports/schedule', method: 'GET', example: '/api/isports/schedule?date=2026-09-15' },
+      {
+        path: '/api/isports/schedule',
+        method: 'GET',
+        params: ['date | leagueId | matchId', 'season', 'subLeagueId', 'stageId'],
+        description:
+          'Exactly one of date, leagueId, matchId is required. ' +
+          'season/subLeagueId/stageId only work with leagueId.',
+        examples: [
+          '/api/isports/schedule?date=2026-09-15',
+          '/api/isports/schedule?leagueId=1639',
+          '/api/isports/schedule?leagueId=1639&season=2025-2026',
+          '/api/isports/schedule?matchId=12345,67890',
+        ],
+      },
       { path: '/api/isports/match', method: 'GET', example: '/api/isports/match?matchId=12345' },
       { path: '/api/isports/teams', method: 'GET', example: '/api/isports/teams?leagueId=133' },
       { path: '/api/isports/team', method: 'GET', example: '/api/isports/team?teamId=7' },
@@ -887,6 +981,8 @@ app.listen(PORT, () => {
   console.log(`  - Countries: /api/isports/countries`);
   console.log(`  - Live:      /api/isports/livescores`);
   console.log(`  - Schedule:  /api/isports/schedule?date=YYYY-MM-DD`);
+  console.log(`               /api/isports/schedule?leagueId=1639`);
+  console.log(`               /api/isports/schedule?matchId=12345,67890`);
   console.log(`  - Teams:     /api/isports/teams?leagueId=...`);
   console.log(`  - Standings: /api/isports/standings?leagueId=...`);
   console.log(`  - Lineups:   /api/isports/lineups?matchId=...`);
