@@ -3,6 +3,8 @@ const NodeCache = require('node-cache');
 const cors = require('cors');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -43,6 +45,37 @@ const cache = new NodeCache({
   stdTTL: CONFIG.cache.stdTTL,
   checkperiod: CONFIG.cache.checkperiod,
 });
+
+// ============ LOCAL LEAGUES DATA ============
+// /league/list is gated behind a paid plan for some accounts. We ship the
+// full list as a JSON file and serve it locally.
+let LOCAL_LEAGUES = [];
+
+function loadLocalLeagues() {
+  const filePath = path.join(__dirname, 'data', 'leagues.json');
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const parsed = JSON.parse(raw);
+
+    if (Array.isArray(parsed)) {
+      LOCAL_LEAGUES = parsed;
+    } else if (parsed && Array.isArray(parsed.data)) {
+      LOCAL_LEAGUES = parsed.data;
+    } else {
+      console.warn('⚠️  leagues.json is not an array or {data:[...]} envelope');
+      LOCAL_LEAGUES = [];
+    }
+
+    console.log(
+      `✅ Loaded ${LOCAL_LEAGUES.length} leagues from data/leagues.json`
+    );
+  } catch (err) {
+    console.warn('⚠️  Failed to load data/leagues.json:', err.message);
+    LOCAL_LEAGUES = [];
+  }
+}
+
+loadLocalLeagues();
 
 // ============ ISPOPRTS API SERVICE ============
 class ISportsService {
@@ -93,15 +126,6 @@ class ISportsService {
       clearTimeout(timeoutId);
       throw error;
     }
-  }
-
-  // ============ LEAGUES ============
-  async getLeagueList() {
-    return this.fetchWithTimeout(this.buildUrl('/sport/football/league/list'));
-  }
-
-  async getLeaguesBasic() {
-    return this.fetchWithTimeout(this.buildUrl('/sport/football/league/basic'));
   }
 
   // ============ COUNTRIES ============
@@ -279,57 +303,54 @@ async function getLogosForMatches(matches) {
 
 /**
  * Rewrite an iSportsAPI league logo URL to the thscore CDN.
+ * Handles .jpg, .jpeg, .png, .gif source extensions.
+ *
  * Input:  http://zq.titan007.com/Image/league_match/images/20200420184115.jpg?win007=sell
  * Output: https://imgcms.thscore.fun/football/Image/league_match/images/20200420184115.png
  */
 function rewriteLeagueLogo(logo) {
   if (!logo || typeof logo !== 'string') return '';
-  try {
-    const slug = logo
-      .split('http://zq.titan007.com/Image/league_match/images/')[1]
-      .split('.jpg?win007=sell')[0];
-    if (!slug) return '';
-    return `https://imgcms.thscore.fun/football/Image/league_match/images/${slug}.png`;
-  } catch {
-    return '';
-  }
+  const afterHost = logo.split(
+    'http://zq.titan007.com/Image/league_match/images/'
+  )[1];
+  if (!afterHost) return '';
+  const slug = afterHost.split('?')[0].replace(/\.(jpg|jpeg|png|gif)$/i, '');
+  if (!slug) return '';
+  return `https://imgcms.thscore.fun/football/Image/league_match/images/${slug}.png`;
+}
+
+/**
+ * Rewrite an iSportsAPI country logo URL to the thscore CDN.
+ *
+ * Input:  http://zq.titan007.com/Image/info/images/1k7b5vqkmr1f.jpg?win007=sell
+ * Output: https://imgcms.thscore.fun/football/Image/info/images/1k7b5vqkmr1f.png
+ */
+function rewriteCountryLogo(logo) {
+  if (!logo || typeof logo !== 'string') return '';
+  const afterHost = logo.split(
+    'http://zq.titan007.com/Image/info/images/'
+  )[1];
+  if (!afterHost) return '';
+  const slug = afterHost.split('?')[0].replace(/\.(jpg|jpeg|png|gif)$/i, '');
+  if (!slug) return '';
+  return `https://imgcms.thscore.fun/football/Image/info/images/${slug}.png`;
 }
 
 /**
  * Rewrite an iSportsAPI team logo URL to the thscore CDN.
- * Input:  http://zq.titan007.com/Image/team/images/300/1m0p22mxxw6.png?win007=sell
- * Output: https://imgcms.thscore.fun/football/Image/team/images/300/1m0p22mxxw6.png
- *
- * @param {string} logo raw logo URL
- * @param {string|number} teamId team id (used as fallback path segment)
+ * Handles both patterns:
+ *   .../team/images/{teamId}/{filename}.png?win007=sell
+ *   .../team/images/{filename}.png?win007=sell
  */
-function rewriteTeamLogo(logo, teamId) {
+function rewriteTeamLogo(logo) {
   if (!logo || typeof logo !== 'string') return '';
-
-  // Try the standard pattern first.
-  try {
-    const afterHost = logo.split(
-      'http://zq.titan007.com/Image/team/images/'
-    )[1];
-    if (afterHost) {
-      // afterHost = "300/1m0p22mxxw6.png?win007=sell"
-      const path = afterHost.split('?')[0]; // "300/1m0p22mxxw6.png"
-      return `https://imgcms.thscore.fun/football/Image/team/images/${path}`;
-    }
-  } catch {}
-
-  // Fallback: pattern where the URL has no team-id directory.
-  // e.g. http://zq.titan007.com/Image/team/images/1jr565tbs5z.png?win007=sell
-  try {
-    const afterHost = logo
-      .split('http://zq.titan007.com/Image/team/images/')[1];
-    if (afterHost) {
-      const filename = afterHost.split('?')[0];
-      return `https://imgcms.thscore.fun/football/Image/team/images/${filename}`;
-    }
-  } catch {}
-
-  return '';
+  const afterHost = logo.split(
+    'http://zq.titan007.com/Image/team/images/'
+  )[1];
+  if (!afterHost) return '';
+  const pathPart = afterHost.split('?')[0];
+  if (!pathPart) return '';
+  return `https://imgcms.thscore.fun/football/Image/team/images/${pathPart}`;
 }
 
 // ============ HELPERS ============
@@ -357,33 +378,69 @@ function cacheGetOrSet(res, key, producer) {
 
 /**
  * GET /api/isports/leagues
- * Full league list. Rewrites logo + adds countryLogo.
- * Uses /league/list so we're not limited by the basic endpoint.
+ * Serves the full league list from data/leagues.json.
+ * Rewrites league + country logos. No iSportsAPI call — works regardless
+ * of plan limits.
  */
 app.get(
   '/api/isports/leagues',
   wrap(async (req, res) => {
-    await cacheGetOrSet(res, 'isports_leagues_list', async () => {
-      const raw = await isports.getLeagueList();
-      if (!Array.isArray(raw)) return [];
+    const cached = cache.get('isports_leagues_local');
+    if (cached) {
+      return res.json({ success: true, source: 'cache', data: cached });
+    }
 
-      return raw.map((item) => {
-        const { countryId, logo } = item;
-        return {
-          ...item,
-          logo: rewriteLeagueLogo(logo),
-          countryLogo: countryId
-            ? `https://imgcms.thscore.fun/mini/fbcountry/${countryId}-flag-small.png`
-            : '',
-        };
+    if (!LOCAL_LEAGUES.length) {
+      return res.status(500).json({
+        success: false,
+        error: 'Local leagues data is empty — check data/leagues.json',
       });
+    }
+
+    const enriched = LOCAL_LEAGUES.map((item) => {
+      const { countryId, logo, countryLogo } = item;
+
+      const rewrittenCountryLogo = countryLogo
+        ? rewriteCountryLogo(countryLogo)
+        : countryId
+          ? `https://imgcms.thscore.fun/mini/fbcountry/${countryId}-flag-small.png`
+          : '';
+
+      return {
+        ...item,
+        logo: rewriteLeagueLogo(logo),
+        countryLogo: rewrittenCountryLogo,
+      };
+    });
+
+    cache.set('isports_leagues_local', enriched, 6 * 60 * 60); // 6 hours
+
+    res.json({
+      success: true,
+      source: 'local',
+      data: enriched,
+      timestamp: new Date().toISOString(),
     });
   })
 );
 
 /**
+ * POST /api/isports/leagues/reload
+ * Re-reads data/leagues.json from disk and invalidates the cache.
+ */
+app.post('/api/isports/leagues/reload', (req, res) => {
+  loadLocalLeagues();
+  cache.del('isports_leagues_local');
+  res.json({
+    success: true,
+    count: LOCAL_LEAGUES.length,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+/**
  * GET /api/isports/countries
- * Full country list.
+ * Full country list with flag URL added.
  */
 app.get(
   '/api/isports/countries',
@@ -422,8 +479,8 @@ app.get(
         const { homeId, awayId } = item;
         return {
           ...item,
-          homeTeamLogo: rewriteTeamLogo(teamLogos[homeId], homeId),
-          awayTeamLogo: rewriteTeamLogo(teamLogos[awayId], awayId),
+          homeTeamLogo: rewriteTeamLogo(teamLogos[homeId]),
+          awayTeamLogo: rewriteTeamLogo(teamLogos[awayId]),
         };
       });
     });
@@ -456,8 +513,8 @@ app.get(
         const { homeId, awayId } = item;
         return {
           ...item,
-          homeTeamLogo: rewriteTeamLogo(teamLogos[homeId], homeId),
-          awayTeamLogo: rewriteTeamLogo(teamLogos[awayId], awayId),
+          homeTeamLogo: rewriteTeamLogo(teamLogos[homeId]),
+          awayTeamLogo: rewriteTeamLogo(teamLogos[awayId]),
         };
       });
     });
@@ -501,10 +558,10 @@ app.get(
       if (!Array.isArray(raw)) return [];
 
       return raw.map((item) => {
-        const { teamId, logo } = item;
+        const { logo } = item;
         return {
           ...item,
-          logo: rewriteTeamLogo(logo, teamId),
+          logo: rewriteTeamLogo(logo),
         };
       });
     });
@@ -751,6 +808,9 @@ app.get('/api/cache/stats', (req, res) => {
       leagues: leagueLogoCache.size,
       inflight: leagueLogoInflight.size,
     },
+    localLeagues: {
+      loaded: LOCAL_LEAGUES.length,
+    },
     timestamp: new Date().toISOString(),
   });
 });
@@ -768,6 +828,9 @@ app.get('/api/health', (req, res) => {
       leagues: leagueLogoCache.size,
       inflight: leagueLogoInflight.size,
     },
+    localLeagues: {
+      loaded: LOCAL_LEAGUES.length,
+    },
     timestamp: new Date().toISOString(),
   });
 });
@@ -776,12 +839,13 @@ app.get('/api/health', (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     name: 'iSportsAPI Proxy',
-    version: '2.0.0',
+    version: '2.1.0',
     description:
-      'Express proxy for iSportsAPI with CORS, caching, and thscore CDN logo rewrites',
+      'Express proxy for iSportsAPI with CORS, caching, local leagues file, and thscore CDN logo rewrites',
     baseUrl: `http://localhost:${PORT}`,
     endpoints: [
       { path: '/api/isports/leagues', method: 'GET', example: '/api/isports/leagues' },
+      { path: '/api/isports/leagues/reload', method: 'POST', example: '/api/isports/leagues/reload' },
       { path: '/api/isports/countries', method: 'GET', example: '/api/isports/countries' },
       { path: '/api/isports/livescores', method: 'GET', example: '/api/isports/livescores' },
       { path: '/api/isports/schedule', method: 'GET', example: '/api/isports/schedule?date=2026-09-15' },
@@ -816,10 +880,10 @@ app.use((err, req, res, next) => {
 
 // ============ START ============
 app.listen(PORT, () => {
-  console.log(`\n🚀 iSportsAPI Proxy v2.0`);
+  console.log(`\n🚀 iSportsAPI Proxy v2.1`);
   console.log(`📡 http://localhost:${PORT}`);
   console.log(`\n📊 Endpoints:`);
-  console.log(`  - Leagues:   /api/isports/leagues   (uses /league/list)`);
+  console.log(`  - Leagues:   /api/isports/leagues   (local file)`);
   console.log(`  - Countries: /api/isports/countries`);
   console.log(`  - Live:      /api/isports/livescores`);
   console.log(`  - Schedule:  /api/isports/schedule?date=YYYY-MM-DD`);
