@@ -309,14 +309,14 @@ async function getLogosForMatches(matches) {
  * Output: https://imgcms.thscore.fun/football/Image/league_match/images/20200420184115.png
  */
 function rewriteLeagueLogo(logo) {
-  if (!logo || typeof logo !== 'string') return '';
+  /*if (!logo || typeof logo !== 'string') return '';
   const afterHost = logo.split(
     'http://zq.titan007.com/Image/league_match/images/'
   )[1];
   if (!afterHost) return '';
   const slug = afterHost.split('?')[0].replace(/\.(jpg|jpeg|png|gif)$/i, '');
-  if (!slug) return '';
-  return `https://imgcms.thscore.fun/football/Image/league_match/images/${slug}.png`;
+  if (!slug) return '';*/
+  return logo//`https://imgcms.thscore.fun/football/Image/league_match/images/${slug}.png`;
 }
 
 /**
