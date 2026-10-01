@@ -2,7 +2,7 @@
   "name": "express-simple-starter",
   "private": true,
   "scripts": {
-    "start": "node index.js"
+    "start": "node index1.js"
   },
   "dependencies": {
     "axios": "^1.20.0",

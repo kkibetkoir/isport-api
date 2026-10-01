@@ -16,13 +16,13 @@ app.use(express.json());
 
 const limiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 100,
+  max: 150,
   message: {
     success: false,
     error: 'Too many requests, please try again later.',
   },
 });
-app.use('/api', limiter);
+//app.use('/api', limiter);
 
 // ============ CONFIGURATION ============
 const CONFIG = {
@@ -367,9 +367,12 @@ function rewriteTeamLogo(logo) {
   const afterHost = logo.split(
     'http://zq.titan007.com/Image/team/images/'
   )[1];
-  if (!afterHost) return '';
+  if (!afterHost) return logo;//'';
   const pathPart = afterHost.split('?')[0];
   if (!pathPart) return '';
+  //https://imgcms.thscore.fun//football/Image/team/images/1h4at82pjp32.png
+  //https://imgcms.thscore.fun//football/Image/team/images/43536/1h88bm9kb7x.png
+  //https://imgcms.thscore.fun//football/Image/team/images/5526/1m04731mama.png
   return `https://imgcms.thscore.fun/football/Image/team/images/${pathPart}`;
 }
 
