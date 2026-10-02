@@ -289,6 +289,33 @@ class ISportsService {
       this.buildUrl('/sport/football/player', { playerId })
     );
   }
+
+  /**
+ * Top scorers for a league. iSportsAPI limits to 10s/call, recommends 1/day.
+ * @param {object} params
+ * @param {string} params.leagueId  required
+ * @param {string} [params.season]  only with leagueId
+ */
+  async getTopScorers({ leagueId, season } = {}) {
+    return this.fetchWithTimeout(
+      this.buildUrl('/sport/football/topscorer', { leagueId, season }),
+      30000
+    );
+  }
+
+  /**
+   * Player lookup. Exactly one of `teamId`, `playerId`, or `day` is required.
+   * @param {object} params
+   * @param {string} [params.teamId]     up to 50 ids, comma-separated
+   * @param {string} [params.playerId]
+   * @param {string} [params.day]        updated within last N days
+   * @param {string} [params.cmd]        "more" for extended data
+   */
+  async getPlayers({ teamId, playerId, day, cmd } = {}) {
+    return this.fetchWithTimeout(
+      this.buildUrl('/sport/football/player', { teamId, playerId, day, cmd })
+    );
+  }
 }
 
 const isports = new ISportsService();
@@ -419,6 +446,23 @@ function ensureTeamLogo(teamId, rawLogo) {
   return '';
 }
 
+
+/**
+ * Rewrite an iSportsAPI player photo URL to the thscore CDN.
+ *
+ * Input:  http://zq.titan007.com/Image/player/images/2016225183959.jpg?win007=sell
+ * Output: https://imgcms.thscore.fun/football/Image/player/images/2016225183959.png
+ */
+function rewritePlayerPhoto(photo) {
+  if (!photo || typeof photo !== 'string') return '';
+  const afterHost = photo.split(
+    'http://zq.titan007.com/Image/player/images/'
+  )[1];
+  if (!afterHost) return '';
+  const slug = afterHost.split('?')[0].replace(/\.(jpg|jpeg|png|gif)$/i, '');
+  if (!slug) return '';
+  return `https://imgcms.thscore.fun/football/Image/player/images/${slug}.png`;
+}
 // ============ HELPERS ============
 const wrap = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
@@ -729,8 +773,8 @@ app.get(
 
     const filtered = leagueId
       ? LOCAL_TEAMS.filter(
-          (t) => String(t.leagueId ?? '') === String(leagueId)
-        )
+        (t) => String(t.leagueId ?? '') === String(leagueId)
+      )
       : LOCAL_TEAMS;
 
     const enriched = filtered.map((item) => ({
@@ -1305,6 +1349,101 @@ app.get(
   })
 );
 
+/**
+ * GET /api/isports/topscorer?leagueId=...&season=...
+ * Top scorers with team logos enriched.
+ */
+app.get(
+  '/api/isports/topscorer',
+  limiterDetail,
+  wrap(async (req, res) => {
+    const { leagueId, season } = req.query;
+    if (!leagueId) {
+      return res.status(400).json({
+        success: false,
+        error: 'leagueId parameter is required',
+        usage: '/api/isports/topscorer?leagueId=1572',
+      });
+    }
+
+    const cacheKey = season
+      ? `isports_topscorer_${leagueId}_${season}`
+      : `isports_topscorer_${leagueId}`;
+
+    await cacheGetOrSet(res, caches.standings, cacheKey, async () => {
+      const raw = await isports.getTopScorers({ leagueId, season });
+      if (!Array.isArray(raw)) return [];
+      quota.record('topscorer');
+
+      return raw.map((row) => {
+        const teamId = String(row.teamId ?? '');
+        return {
+          ...row,
+          teamLogo: ensureTeamLogo(teamId, ''),
+        };
+      });
+    });
+  })
+);
+
+/**
+ * GET /api/isports/player
+ * Selector: exactly one of ?teamId=... | ?playerId=... | ?day=...
+ * Optional: ?cmd=more
+ *
+ * Rewrites player photos and adds team logos.
+ */
+app.get(
+  '/api/isports/player',
+  limiterDetail,
+  wrap(async (req, res) => {
+    const { teamId, playerId, day, cmd } = req.query;
+
+    const selectors = [teamId, playerId, day].filter(
+      (v) => v !== undefined && v !== null && v !== ''
+    );
+
+    if (selectors.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'One of teamId, playerId, or day is required',
+        usage: '/api/isports/player?teamId=4140',
+      });
+    }
+    if (selectors.length > 1) {
+      return res.status(400).json({
+        success: false,
+        error: 'teamId, playerId, and day are mutually exclusive',
+      });
+    }
+
+    let cacheKey;
+    if (teamId) cacheKey = `isports_player_team_${teamId}`;
+    else if (playerId) cacheKey = `isports_player_id_${playerId}`;
+    else cacheKey = `isports_player_day_${day}`;
+    if (cmd) cacheKey += `_${cmd}`;
+
+    const ttl = day ? 6 * 60 * 60 : undefined;
+    cacheGetOrSet(res, caches.player, cacheKey, producer, ttl);
+
+    //await cacheGetOrSet(res, caches.player, cacheKey, async () => {
+    await cacheGetOrSet(res, caches.player, cacheKey, ttl, async () => {
+      const raw = await isports.getPlayers({ teamId, playerId, day, cmd });
+      if (!Array.isArray(raw)) return [];
+      quota.record('player');
+
+      return raw.map((p) => {
+        const tid = String(p.teamId ?? '');
+        return {
+          ...p,
+          photo: rewritePlayerPhoto(p.photo),
+          teamLogo: ensureTeamLogo(tid, ''),
+        };
+      });
+    });
+  })
+);
+
 // ============ SYSTEM ENDPOINTS ============
 
 /**
@@ -1420,6 +1559,8 @@ app.get('/', (req, res) => {
       { path: '/api/isports/events' },
       { path: '/api/isports/stats' },
       { path: '/api/isports/player' },
+      { path: '/api/isports/topscorer', method: 'GET' },
+      { path: '/api/isports/player',   method: 'GET' },
     ],
     backgroundPollers: {
       scheduleChange: 'every 30 min → maintains in-memory schedule index',
