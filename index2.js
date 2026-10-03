@@ -49,6 +49,7 @@ const CACHE_TTLS = {
   match: 120,
   standings: 5 * 60,
   lineups: 5 * 60,
+  h2h: 24 * 60 * 60,   // analysis data is cached 24h upstream; match that
 
   // Events / stats change every minute during a match.
   events: 30,
@@ -283,6 +284,18 @@ class ISportsService {
     );
   }
 
+    // ============ H2H ============
+  /**
+ * Match analysis. Returns head-to-head + recent form + more.
+ * iSportsAPI limits to 1s/call, recommends 1/day.
+ * @param {string} matchId
+ */
+async getAnalysis(matchId) {
+  return this.fetchWithTimeout(
+    this.buildUrl('/sport/football/analysis', { matchId })
+  );
+}
+
   // ============ PLAYERS ============
   async getPlayerDetail(playerId) {
     return this.fetchWithTimeout(
@@ -463,6 +476,55 @@ function rewritePlayerPhoto(photo) {
   if (!slug) return '';
   return `https://imgcms.thscore.fun/football/Image/player/images/${slug}.png`;
 }
+
+/**
+ * Parse a single iSportsAPI CSV row from an analysis array into an object.
+ * Rows look like:
+ *   "395140920,MEX LT,190616,1764363600,Home Name,60013,Away Name,63557,3,2,1,0,0,0,2,6,,,,,,..."
+ * Trailing empty fields are ignored.
+ */
+function parseMatchRow(row) {
+  if (typeof row !== 'string' || row.length === 0) return null;
+
+  const f = row.split(',');
+
+  // Helper: return '' for missing/undefined so the JSON is consistent.
+  const at = (i) => (f[i] !== undefined ? f[i] : '');
+  const intAt = (i) => {
+    const v = at(i);
+    if (v === '') return null;
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  return {
+    matchId: at(0),
+    league: at(1),
+    leagueId: at(2),
+    matchTime: intAt(3),
+    home: at(4),
+    homeTeamId: at(5),
+    away: at(6),
+    awayTeamId: at(7),
+    scoreHome: intAt(8),
+    scoreAway: intAt(9),
+    homeHalfScore: intAt(10),
+    awayHalfScore: intAt(11),
+    homeRed: intAt(12),
+    awayRed: intAt(13),
+    homeCorner: intAt(14),
+    awayCorner: intAt(15),
+  };
+}
+
+/**
+ * Parse one of the analysis arrays (headToHead, homeLastMatches, ...).
+ */
+function parseMatchRows(rows) {
+  if (!Array.isArray(rows)) return [];
+  return rows.map(parseMatchRow).filter(Boolean);
+}
+
 // ============ HELPERS ============
 const wrap = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
@@ -1265,6 +1327,57 @@ app.get(
         return raw;
       }
     );
+  })
+);
+
+/**
+ * GET /api/isports/h2h?matchId=...
+ *
+ * Returns head-to-head + recent-form analysis for a match.
+ * The three relevant arrays are parsed from iSportsAPI's CSV-string
+ * format into proper JSON objects. Everything else passes through as-is.
+ */
+app.get(
+  '/api/isports/h2h',
+  limiterDetail,
+  wrap(async (req, res) => {
+    const { matchId } = req.query;
+    if (!matchId) {
+      return res.status(400).json({
+        success: false,
+        error: 'matchId parameter is required',
+        usage: '/api/isports/h2h?matchId=211379034',
+      });
+    }
+
+    await cacheGetOrSet(res, caches.h2h, `isports_h2h_${matchId}`, async () => {
+      const raw = await isports.getAnalysis(matchId);
+      if (!raw || typeof raw !== 'object') return raw;
+      quota.record('h2h');
+
+      return {
+        // Parsed into JSON objects — this is what clients care about.
+        headToHead: parseMatchRows(raw.headToHead),
+        homeLastMatches: parseMatchRows(raw.homeLastMatches),
+        awayLastMatches: parseMatchRows(raw.awayLastMatches),
+
+        // Pass through the rest untouched so nothing is lost.
+        homeSchedule: raw.homeSchedule ?? [],
+        awaySchedule: raw.awaySchedule ?? [],
+        homeOdds: raw.homeOdds ?? [],
+        awayOdds: raw.awayOdds ?? [],
+        homeGoals: raw.homeGoals ?? [],
+        awayGoals: raw.awayGoals ?? [],
+        homeHT: raw.homeHT ?? [],
+        awayHT: raw.awayHT ?? [],
+        homeShootTime: raw.homeShootTime ?? [],
+        awayShootTime: raw.awayShootTime ?? [],
+        homeSingleDouble: raw.homeSingleDouble ?? [],
+        awaySingleDouble: raw.awaySingleDouble ?? [],
+        homeDataVs: raw.homeDataVs ?? [],
+        awayDataVs: raw.awayDataVs ?? [],
+      };
+    });
   })
 );
 
