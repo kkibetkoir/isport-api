@@ -57,6 +57,9 @@ const CACHE_TTLS = {
 
   // Player profile is basically static.
   player: 60 * 60,
+
+  // ...existing entries...
+  odds: 24 * 60 * 60,   // odds data refreshes once a day (per iSportsAPI guidance)
 };
 
 const caches = Object.fromEntries(
@@ -329,6 +332,19 @@ async getAnalysis(matchId) {
       this.buildUrl('/sport/football/player', { teamId, playerId, day, cmd })
     );
   }
+
+  /**
+  * Main odds (Asian Handicap, 1X2, over/under — full and first-half).
+  * @param {object} params
+  * @param {string} [params.matchId]    one or more ids, comma-separated (max 100)
+  * @param {string} [params.companyId]  one or more bookmaker ids, comma-separated
+  */
+  async getOdds({ matchId, companyId } = {}) {
+    return this.fetchWithTimeout(
+      this.buildUrl('/sport/football/odds/main', { matchId, companyId }),
+      30000
+    );
+  }
 }
 
 const isports = new ISportsService();
@@ -523,6 +539,58 @@ function parseMatchRow(row) {
 function parseMatchRows(rows) {
   if (!Array.isArray(rows)) return [];
   return rows.map(parseMatchRow).filter(Boolean);
+}
+
+/**
+ * Parse one Asian Handicap CSV row from /odds/main.
+ * Field order (from iSportsAPI docs):
+ *   matchId, companyId,
+ *   initialHandicap, initialHome, initialAway,
+ *   instantHandicap, instantHome, instantAway,
+ *   maintenance, inPlay, changeTime, close, oddsType
+ */
+function parseHandicapRow(row) {
+  if (typeof row !== 'string' || row.length === 0) return null;
+  const f = row.split(',');
+  const at = (i) => (f[i] !== undefined ? f[i] : '');
+  const intAt = (i) => {
+    const v = at(i);
+    if (v === '') return null;
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) ? n : null;
+  };
+  const boolAt = (i) => at(i) === 'true';
+  const numAt = (i) => {
+    const v = at(i);
+    if (v === '') return null;
+    const n = parseFloat(v);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  return {
+    matchId: at(0),
+    companyId: at(1),
+    initialHandicap: numAt(2),
+    initialHome: numAt(3),
+    initialAway: numAt(4),
+    instantHandicap: numAt(5),
+    instantHome: numAt(6),
+    instantAway: numAt(7),
+    maintenance: boolAt(8),
+    inPlay: boolAt(9),
+    changeTime: intAt(10),
+    close: boolAt(11),
+    oddsType: intAt(12),
+  };
+}
+
+/**
+ * Generic parser factory — plug in the number of fields for any other
+ * market array when you know its column order.
+ */
+function parseCsvRows(rows, rowParser) {
+  if (!Array.isArray(rows)) return [];
+  return rows.map(rowParser).filter(Boolean);
 }
 
 // ============ HELPERS ============
@@ -1557,6 +1625,45 @@ app.get(
   })
 );
 
+/**
+ * GET /api/isports/odds
+ * Optional: ?matchId=... &companyId=...
+ *
+ * Returns parsed JSON. All markets are parsed from CSV into objects.
+ * Cached for 24 hours per unique query shape.
+ */
+app.get(
+  '/api/isports/odds',
+  limiterDetail,
+  wrap(async (req, res) => {
+    const { matchId, companyId } = req.query;
+
+    // Cache key includes query shape so ?matchId=1 and ?companyId=3 don't collide.
+    let cacheKey = 'isports_odds_main';
+    if (matchId) cacheKey += `_m_${matchId}`;
+    if (companyId) cacheKey += `_c_${companyId}`;
+
+    await cacheGetOrSet(res, caches.odds, cacheKey, async () => {
+      const raw = await isports.getOdds({ matchId, companyId });
+      if (!raw || typeof raw !== 'object') return raw;
+      quota.record('odds');
+
+      return {
+        handicap: parseCsvRows(raw.handicap, parseHandicapRow),
+
+        // If iSportsAPI returns additional markets with known column order,
+        // add parsers here. Until you confirm the layout, pass them through
+        // as-is so nothing is lost.
+        europe: raw.europe ?? [],
+        overUnder: raw.overUnder ?? raw.total ?? [],
+        firstHalfHandicap: raw.firstHalfHandicap ?? [],
+        firstHalfEurope: raw.firstHalfEurope ?? [],
+        firstHalfOverUnder: raw.firstHalfOverUnder ?? [],
+      };
+    });
+  })
+);
+
 // ============ SYSTEM ENDPOINTS ============
 
 /**
@@ -1674,6 +1781,7 @@ app.get('/', (req, res) => {
       { path: '/api/isports/player' },
       { path: '/api/isports/topscorer', method: 'GET' },
       { path: '/api/isports/player',   method: 'GET' },
+      { path: '/api/isports/odds', method: 'GET', params: ['matchId', 'companyId'] },
     ],
     backgroundPollers: {
       scheduleChange: 'every 30 min → maintains in-memory schedule index',
