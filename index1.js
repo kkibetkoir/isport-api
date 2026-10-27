@@ -199,7 +199,7 @@ class ISportsService {
 
   async getMatchStats(matchId) {
     return this.fetchWithTimeout(
-      this.buildUrl('/sport/football/events/stats', { matchId })
+      this.buildUrl('/sport/football/stats', { matchId })
     );
   }
 
